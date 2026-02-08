@@ -1,0 +1,5 @@
+__pycache__/
+*.vtk
+.venv/
+.DS_Store
+package-lock.json
