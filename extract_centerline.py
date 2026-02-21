@@ -303,6 +303,7 @@ class CenterlineEditor:
         self.p.add_key_event('z', self.undo)
         self.p.add_key_event('y', self.redo)
         self.p.add_key_event('s', self.save_smart)
+        self.p.add_key_event('a', self.add_points_action)
         
         # UI Buttons (2D actors)
         self.setup_ui()
@@ -351,53 +352,59 @@ class CenterlineEditor:
         add_btn("Save As (S)", start_y - 2*step, self.save_smart)
         add_btn("Volume", start_y - 3*step, self.toggle_voxel_window_action)
         add_btn("Open Curve", start_y - 4*step, self.open_curve_window)
+        add_btn("Add Pts", start_y - 5*step, self.add_points_action)
 
-        # Bind Click Event (Standard priority)
-        self.p.iren.add_observer("LeftButtonPressEvent", self.on_click)
+        # Bind Click Event with very high priority
+        self.p.iren.add_observer("LeftButtonPressEvent", self.on_click, 10.0)
         
     def toggle_voxel_window_action(self):
         self.open_voxel_window(True)
 
     def on_click(self, obj, event):
         click_pos = self.p.iren.get_event_position() # (x, y) pixels
-        w, h = self.p.window_size
+        
+        # DEBUG: print(f"Click at: {click_pos}")
         
         matched = False
         for btn in self.btn_regions:
-            if 'y_pos' not in btn: continue
+            actor = btn.get('actor')
+            if not actor: continue
             
-            # y_pos is normalized (0-1) from bottom
-            y_start = btn['y_pos'] * h
-            x_start = 0.02 * w
+            renderer = self.p.renderer
             
-            # Estimate dims
-            # A rough estimate: 9px per char width, 25px height
-            char_w = 9 
-            text_w = len(btn['label']) * char_w + 20 
-            text_h = 30 
+            # Get bottom-left of text in pixels
+            pos_px = actor.GetPositionCoordinate().GetComputedDisplayValue(renderer)
             
-            # Check bounds (simple AABB)
-            # Text is anchored at Bottom-Left of the string
-            if (x_start <= click_pos[0] <= x_start + text_w) and \
-               (y_start <= click_pos[1] <= y_start + text_h):
-                   
-                print(f"Clicked Button: {btn['label']}")
+            # Robust bounds calculation
+            # Text actors in VTK are anchored at Bottom-Left.
+            # We'll use a wider hit box for reliability.
+            char_w = 12 # Slightly wider for safety
+            text_w = len(btn['label']) * char_w
+            text_h = 40 # Taller hit box
+            
+            # Check bounds (with a small buffer)
+            is_x_match = (pos_px[0] - 10 <= click_pos[0] <= pos_px[0] + text_w + 10)
+            is_y_match = (pos_px[1] - 10 <= click_pos[1] <= pos_px[1] + text_h + 10)
+            
+            if is_x_match and is_y_match:
+                print(f"Confirmed Button Click: {btn['label'].strip()}")
+                
+                # Ensure dialogs show up on top
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+                root.withdraw() # Keep it hidden but active
+                
                 try:
                     btn['callback']()
                 except Exception as e:
-                    print(f"Error in callback: {e}")
+                    print(f"Error executing {btn['label']}: {e}")
                 
                 matched = True
                 break
         
         if matched:
-            # Consume event
-            try:
-                # self.p.iren is a PyVista RenderWindowInteractor
-                # The underlying VTK interactor is usually exposed or we use the passed 'obj'
-                obj.SetAbortEvent(1)
-            except:
-                pass
+            obj.SetAbortEvent(1)
 
     # Removed old widget callbacks (undo_callback, etc are now direct)
     
@@ -482,6 +489,42 @@ class CenterlineEditor:
         self.set_handles(next_points)
         print("Redo complete.")
 
+    def add_points_action(self):
+        """
+        Increases the number of control points by sampling the current spline.
+        """
+        print("Increasing control point density...")
+        
+        # Current handles
+        old_points = self.get_handles()
+        n_current = len(old_points)
+        
+        # Target: roughly 25% more points
+        n_new = int(n_current * 1.25) + 2
+            
+        if n_new > 1000:
+            print("Maximum handle limit reached (1000).")
+            return
+
+        # Use current handles to generate a smoother version for interpolation
+        try:
+            # We use a high res spline to sample points from
+            temp_spline = pv.Spline(old_points, n_new)
+            new_points = temp_spline.points
+        except Exception as e:
+            print(f"Error increasing points: {e}")
+            return
+            
+        # Push to undo stack
+        self.undo_stack.append(self.current_points)
+        self.redo_stack.clear()
+        
+        # Update state and widget
+        self.current_points = new_points
+        self.set_handles(new_points)
+        
+        print(f"Points increased from {n_current} to {len(new_points)}")
+
     def generate_final_spline(self):
         # Reconstruct high-res spline from current handles
         try:
@@ -500,14 +543,17 @@ class CenterlineEditor:
         default_file = os.path.basename(default_path)
         
         # 2. Open Save As Dialog (using Tkinter hidden root)
-        # filetypes: VTP (XML PolyData) is best for generic modern VTK support.
-        # Omniverse can import OBJ, but curves in OBJ are lines. VTP preserves spline info? Not really, just dense lines.
-        # Ideally USD, but staying with VTP/VTK/OBJ.
+        # Added CSV and OBJ support specifically as requested
         output_file = filedialog.asksaveasfilename(
             initialdir=default_dir,
             initialfile=default_file,
             title="Save Centerline Curve",
-            filetypes=[("VTK XML PolyData", "*.vtp"), ("VTK Legacy", "*.vtk"), ("OBJ", "*.obj")]
+            filetypes=[
+                ("VTK XML PolyData", "*.vtp"), 
+                ("CSV Points", "*.csv"),
+                ("OBJ Wavefront", "*.obj"),
+                ("VTK Legacy", "*.vtk")
+            ]
         )
         
         if not output_file:
@@ -519,14 +565,28 @@ class CenterlineEditor:
         
         # Check extension
         ext = os.path.splitext(output_file)[1].lower()
-        if ext == '.obj':
-            # PyVista save .obj writes surface. A spline is a line. 
-            # Might need specific handling but .save usually handles it.
-            pass
+        
+        try:
+            if ext == '.csv':
+                # Save points as CSV: x, y, z
+                # We use numpy.savetxt for efficiency and to avoid extra dependencies like pandas
+                header = "x,y,z"
+                np.savetxt(output_file, spline.points, delimiter=",", header=header, comments='')
+                print(f"Saved {len(spline.points)} points to CSV.")
+            elif ext == '.obj':
+                # PyVista's save for .obj on PolyData containing lines works in recent versions
+                # It writes 'v' (vertices) and 'l' (lines).
+                spline.save(output_file)
+                print(f"Saved to OBJ.")
+            else:
+                # Default VTK/VTP save
+                spline.save(output_file)
+                print(f"Saved to {ext.upper()}.")
             
-        spline.save(output_file)
-        print("Saved.")
-        self.p.add_text(f"Saved: {os.path.basename(output_file)}", position="upper_right", font_size=16, color='green', name="save_message")
+            self.p.add_text(f"Saved: {os.path.basename(output_file)}", position="upper_right", font_size=16, color='green', name="save_message")
+        except Exception as e:
+            print(f"Error saving file: {e}")
+            self.p.add_text(f"Error saving: {os.path.basename(output_file)}", position="upper_right", font_size=16, color='red', name="save_message")
 
 
     def open_voxel_window(self, state):
@@ -601,15 +661,28 @@ class CenterlineEditor:
 
 def main():
     parser = argparse.ArgumentParser(description="Extract Centerline from Colon STL")
-    parser.add_argument("input_file", help="Path to input STL file")
+    parser.add_argument("input_file", nargs='?', help="Path to input STL file")
     parser.add_argument("--density", type=float, default=None, help="Voxel density (lower is coarser)")
     parser.add_argument("--output", default="centerline.vtk", help="Output filename")
     
     args = parser.parse_args()
     
-    print(f"Loading {args.input_file}...")
+    input_file = args.input_file
+    
+    # GUI Fallback: If no file provided, open picker
+    if not input_file:
+        print("No input file provided. Opening file picker...")
+        input_file = filedialog.askopenfilename(
+            title="Select Colon STL Mesh",
+            filetypes=[("STL Files", "*.stl"), ("PLY Files", "*.ply"), ("OBJ Files", "*.obj"), ("All Files", "*.*")]
+        )
+        if not input_file:
+            print("No file selected. Exiting.")
+            return
+
+    print(f"Loading {input_file}...")
     try:
-        mesh = pv.read(args.input_file)
+        mesh = pv.read(input_file)
     except Exception as e:
         print(f"Error loading mesh: {e}")
         return
@@ -702,7 +775,8 @@ def main():
     p.add_mesh(mesh, style='wireframe', opacity=0.1, color='tan', label='Colon Surface')
     
     # Initialize Editor Class
-    editor = CenterlineEditor(p, control_points, args.input_file, voxel_grid=grid, mesh=mesh)
+    # IMPORTANT: Use 'input_file' which we may have gotten from GUI picker
+    editor = CenterlineEditor(p, control_points, input_file, voxel_grid=grid, mesh=mesh)
     
     # Add text instructions
     # (Removed legacy instructions)
@@ -716,12 +790,30 @@ def main():
     
     # Simple autosave verification:
     # We always save "latest_autosave.vtp" on exit, just in case.
-    print("Saving autosave of final state...")
+    print("Saving autosaves of final state (VTP, CSV, OBJ)...")
     try:
         final_spline = editor.generate_final_spline()
+        # Save VTP
         final_spline.save("latest_autosave.vtp")
+        
+        # Save CSV (x,y,z points)
+        np.savetxt("latest_autosave.csv", final_spline.points, delimiter=",", header="x,y,z", comments='')
+        
+        # Save OBJ (wavefront)
+        final_spline.save("latest_autosave.obj")
+        
+        # Also save to the path specified in --output if provided
+        if args.output and args.output != "centerline.vtk":
+            ext = os.path.splitext(args.output)[1].lower()
+            if ext == '.csv':
+                np.savetxt(args.output, final_spline.points, delimiter=",", header="x,y,z", comments='')
+            else:
+                final_spline.save(args.output)
+            print(f"Final result saved to {args.output}")
+            
+        print("Autosaves complete.")
     except Exception as e:
-        print(f"Error saving autosave: {e}")
+        print(f"Error saving autosave/output: {e}")
 
 if __name__ == "__main__":
     main()
